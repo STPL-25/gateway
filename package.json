@@ -1,0 +1,23 @@
+{
+  "name": "gateway",
+  "version": "1.0.0",
+  "description": "Non-Trade ERP — API Gateway. Single public port (8080) in front of the backend monolith (8081) and the GRN microservice (8084). Bridges the browser's HttpOnly session cookie to the microservice's stateless Bearer JWT auth, and proxies Socket.IO websockets to the backend.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": ["gateway", "reverse-proxy", "microservices", "erp"],
+  "license": "ISC",
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0",
+    "http-proxy-middleware": "^3.0.5",
+    "redis": "^5.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
