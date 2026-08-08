@@ -6,12 +6,14 @@ import cookieParser from "cookie-parser";
 // import { createClient } from "redis";
 import { configDotenv } from "dotenv";
 import { decryptRequestBody, encryptJson } from "./Middleware/payloadCrypto.js";
-configDotenv();
+configDotenv({ path: `.env.${process.env.NODE_ENV || "development"}` });
 
 const PORT = parseInt(process.env.PORT || "8080");
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8081";
-const GRN_SERVICE_URL = process.env.GRN_SERVICE_URL || "http://localhost:8084";
+const GRN_SERVICE_URL = process.env.GRN_SERVICE_URL ;
 const SESSION_SECRET = process.env.SESSION_SECRET;
+const FORWARDED_PROTO =
+  (process.env.FORWARDED_PROTO || (process.env.NODE_ENV === "production" ? "https" : "")).toLowerCase();
 const SERVICE_NAME = "gateway";
 
 if (!SESSION_SECRET) {
@@ -22,6 +24,11 @@ if (!SESSION_SECRET) {
 // Paths owned by grn-service; everything else goes to the backend monolith
 const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", '/grnhealth'];
 const isGrnPath = (path) => GRN_PATHS.some((p) => path === p || path.startsWith(p + "/"));
+const pathnameOf = (path = "") => path.split("?")[0];
+const isSocketIoPath = (path = "") => {
+  const pathname = pathnameOf(path);
+  return pathname === "/socket.io" || pathname.startsWith("/socket.io/");
+};
 
 // ----------------------------
 // REDIS — read-only access to the backend's session store (sess:* keys)
@@ -53,8 +60,35 @@ const redisClient = null;
 const app = express();
 const server = createServer(app);
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+// ----------------------------
+// SOCKET.IO PROXY — mounted first, ahead of the body parser and the
+// payload-crypto layer.
+//
+// Engine.IO must not go through onProxyReq/onProxyRes: responseInterceptor
+// buffers the whole response, which breaks long-polling (a held-open stream),
+// and it re-encrypts application/json bodies into the { d, iv } envelope,
+// which turns Engine.IO's own error/handshake payloads into garbage the
+// socket.io client cannot parse.
+// ----------------------------
+const socketProxy = createProxyMiddleware({
+  target: BACKEND_URL,
+  changeOrigin: true,
+  xfwd: true,
+  ws: true,
+  pathFilter: isSocketIoPath,
+});
+app.use(socketProxy);
 
 app.use(express.json({ limit: "50mb" }));
+
+app.use((req, _res, next) => {
+  const rawProto = req.headers["x-forwarded-proto"];
+  const forwardedProto = Array.isArray(rawProto) ? rawProto[0] : rawProto;
+  req.clientProto = FORWARDED_PROTO || forwardedProto?.split(",")[0]?.trim().toLowerCase() || req.protocol;
+  next();
+});
 
 // Unsigns the express-session cookie (name "sessionId") with the shared SESSION_SECRET
 app.use(cookieParser(SESSION_SECRET));
@@ -64,7 +98,8 @@ app.use(cookieParser(SESSION_SECRET));
 // including its own staff-triggered /invite endpoint) —
 // mirrors the skip-list in frontend/src/main.tsx's request interceptor.
 const CRYPTO_EXEMPT_PATHS = ["/api/secure", "/api/supplier", "/api-docs", "/gateway/health", "/health"];
-const isCryptoExempt = (path) => CRYPTO_EXEMPT_PATHS.some((p) => path === p || path.startsWith(p + "/"));
+const isCryptoExempt = (path) =>
+  isSocketIoPath(path) || CRYPTO_EXEMPT_PATHS.some((p) => path === p || path.startsWith(p + "/"));
 
 app.use((req, res, next) => (isCryptoExempt(req.path) ? next() : decryptRequestBody(req, res, next)));
 
@@ -103,28 +138,31 @@ app.get("/gateway/health", async (_req, res) => {
 // SESSION → BEARER BRIDGE (grn-service routes only)
 //
 // The browser only holds the HttpOnly "sessionId" cookie; the JWT lives
-// server-side in the backend's Redis session (sess:<sid> → { jwt }).
-// grn-service is stateless and expects `Authorization: Bearer <jwt>`,
-// so the gateway looks the session up and injects the header.
+// server-side in the backend's session. grn-service is stateless and expects
+// `Authorization: Bearer <jwt>`, so the gateway asks the backend to resolve
+// the cookie to its JWT (Redis-shared-store approach is commented out for
+// now) and injects the header.
 // ----------------------------
 async function sessionToBearer(req, _res, next) {
   // An explicit Authorization header (e.g. dev bypass token, service-to-service
   // call) always wins — only bridge when the caller relies on the cookie.
   if (req.headers.authorization) return next();
 
-  // Redis integration commented out — will be reintegrated later.
-  // const sid = req.signedCookies?.sessionId;
-  // if (!sid) return next(); // no session — let grn-service answer 401
-  //
-  // try {
-  //   const raw = await redisClient.get(`sess:${sid}`);
-  //   if (raw) {
-  //     const session = JSON.parse(raw);
-  //     if (session?.jwt) req.headers.authorization = `Bearer ${session.jwt}`;
-  //   }
-  // } catch (err) {
-  //   console.error(`[${SERVICE_NAME}] session lookup failed:`, err.message);
-  // }
+  const sid = req.signedCookies?.sessionId;
+  if (!sid) return next(); // no session — let grn-service answer 401
+
+  try {
+    const resp = await fetch(`${BACKEND_URL}/internal/session-jwt`, {
+      headers: { cookie: req.headers.cookie },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (resp.ok) {
+      const { jwt } = await resp.json();
+      if (jwt) req.headers.authorization = `Bearer ${jwt}`;
+    }
+  } catch (err) {
+    console.error(`[${SERVICE_NAME}] session lookup failed:`, err.message);
+  }
   next();
 }
 
@@ -141,6 +179,10 @@ app.use((req, res, next) => (isGrnPath(req.path) ? sessionToBearer(req, res, nex
 // the { d, iv } envelope the frontend expects, via selfHandleResponse.
 // ----------------------------
 function onProxyReq(proxyReq, req) {
+  if (req.clientProto) {
+    proxyReq.setHeader("x-forwarded-proto", req.clientProto);
+  }
+
   // req.body is only set by express.json() when the request actually carried
   // a JSON body — including a legitimate empty object "{}" (e.g. no-param
   // POST endpoints like getSignUpEmployee). Re-check on key count wrongly
@@ -154,7 +196,8 @@ function onProxyReq(proxyReq, req) {
 
 const onProxyRes = responseInterceptor(async (responseBuffer, proxyRes, req) => {
   const contentType = proxyRes.headers["content-type"] || "";
-  if (!contentType.includes("application/json") || isCryptoExempt(req.path)) {
+  const requestPath = req.path || req.originalUrl || req.url || "";
+  if (!contentType.includes("application/json") || isCryptoExempt(requestPath)) {
     return responseBuffer;
   }
   try {
@@ -177,12 +220,12 @@ const grnProxy = createProxyMiddleware({
   on: { proxyReq: onProxyReq, proxyRes: onProxyRes },
 });
 
-// Catch-all → backend monolith. ws:true lets Socket.IO upgrade through the gateway.
+// Catch-all → backend monolith. Socket.IO is handled by socketProxy above.
 const backendProxy = createProxyMiddleware({
   target: BACKEND_URL,
   changeOrigin: true,
   xfwd: true,
-  ws: true,
+  pathFilter: (path) => !isSocketIoPath(path),
   selfHandleResponse: true,
   on: { proxyReq: onProxyReq, proxyRes: onProxyRes },
 });
@@ -191,7 +234,7 @@ app.use(grnProxy);
 app.use(backendProxy);
 
 // Socket.IO websocket upgrades bypass Express routing — wire them explicitly
-server.on("upgrade", backendProxy.upgrade);
+server.on("upgrade", socketProxy.upgrade);
 
 // ----------------------------
 // START + GRACEFUL SHUTDOWN
