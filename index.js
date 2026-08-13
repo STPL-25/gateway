@@ -11,6 +11,7 @@ configDotenv({ path: `.env.${process.env.NODE_ENV || "development"}` });
 const PORT = parseInt(process.env.PORT || "8080");
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8081";
 const GRN_SERVICE_URL = process.env.GRN_SERVICE_URL ;
+const NOTIFY_SERVICE_URL = process.env.NOTIFY_SERVICE_URL || "http://localhost:8086";
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const FORWARDED_PROTO =
   (process.env.FORWARDED_PROTO || (process.env.NODE_ENV === "production" ? "https" : "")).toLowerCase();
@@ -24,6 +25,17 @@ if (!SESSION_SECRET) {
 // Paths owned by grn-service; everything else goes to the backend monolith
 const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", '/grnhealth'];
 const isGrnPath = (path) => GRN_PATHS.some((p) => path === p || path.startsWith(p + "/"));
+
+// Paths owned by notification-service — only the browser-facing bell
+// dropdown (GET/POST/PATCH/DELETE /api/notifications*). Its email-sending
+// routes (/api/notify/email/*) are service-to-service only and are called
+// directly by backend-stpl/grn-service, bypassing the gateway entirely.
+const NOTIFY_PATHS = ["/api/notifications"];
+const isNotifyPath = (path) => NOTIFY_PATHS.some((p) => path === p || path.startsWith(p + "/"));
+
+// Stateless services (grn-service, notification-service) both need the
+// cookie->bearer bridge below.
+const isStatelessServicePath = (path) => isGrnPath(path) || isNotifyPath(path);
 const pathnameOf = (path = "") => path.split("?")[0];
 const isSocketIoPath = (path = "") => {
   const pathname = pathnameOf(path);
@@ -116,13 +128,14 @@ async function probe(url) {
 }
 
 app.get("/gateway/health", async (_req, res) => {
-  const [backend, grn] = await Promise.all([
+  const [backend, grn, notify] = await Promise.all([
     probe(`${BACKEND_URL}/health`),
     probe(`${GRN_SERVICE_URL}/health`),
+    probe(`${NOTIFY_SERVICE_URL}/health`),
   ]);
   // Redis integration commented out — will be reintegrated later.
   // const redis = redisClient.isReady ? "up" : "down";
-  const allUp = backend === "up" && grn === "up";
+  const allUp = backend === "up" && grn === "up" && notify === "up";
   res.status(allUp ? 200 : 503).json({
     service: SERVICE_NAME,
     status: "up",
@@ -130,15 +143,17 @@ app.get("/gateway/health", async (_req, res) => {
     downstream: {
       backend: { url: BACKEND_URL, status: backend },
       "grn-service": { url: GRN_SERVICE_URL, status: grn },
+      "notification-service": { url: NOTIFY_SERVICE_URL, status: notify },
     },
   });
 });
 
 // ----------------------------
-// SESSION → BEARER BRIDGE (grn-service routes only)
+// SESSION → BEARER BRIDGE (stateless downstream services: grn-service,
+// notification-service)
 //
 // The browser only holds the HttpOnly "sessionId" cookie; the JWT lives
-// server-side in the backend's session. grn-service is stateless and expects
+// server-side in the backend's session. Stateless services expect
 // `Authorization: Bearer <jwt>`, so the gateway asks the backend to resolve
 // the cookie to its JWT (Redis-shared-store approach is commented out for
 // now) and injects the header.
@@ -166,7 +181,7 @@ async function sessionToBearer(req, _res, next) {
   next();
 }
 
-app.use((req, res, next) => (isGrnPath(req.path) ? sessionToBearer(req, res, next) : next()));
+app.use((req, res, next) => (isStatelessServicePath(req.path) ? sessionToBearer(req, res, next) : next()));
 
 // ----------------------------
 // PAYLOAD CRYPTO ↔ PROXY WIRING
@@ -220,6 +235,15 @@ const grnProxy = createProxyMiddleware({
   on: { proxyReq: onProxyReq, proxyRes: onProxyRes },
 });
 
+const notifyProxy = createProxyMiddleware({
+  target: NOTIFY_SERVICE_URL,
+  changeOrigin: true,
+  xfwd: true,
+  pathFilter: NOTIFY_PATHS,
+  selfHandleResponse: true,
+  on: { proxyReq: onProxyReq, proxyRes: onProxyRes },
+});
+
 // Catch-all → backend monolith. Socket.IO is handled by socketProxy above.
 const backendProxy = createProxyMiddleware({
   target: BACKEND_URL,
@@ -231,6 +255,7 @@ const backendProxy = createProxyMiddleware({
 });
 
 app.use(grnProxy);
+app.use(notifyProxy);
 app.use(backendProxy);
 
 // Socket.IO websocket upgrades bypass Express routing — wire them explicitly
@@ -242,6 +267,7 @@ server.on("upgrade", socketProxy.upgrade);
 server.listen(PORT, () => {
   console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
   console.log(`[${SERVICE_NAME}]   ${GRN_PATHS.join(", ")} → ${GRN_SERVICE_URL}`);
+  console.log(`[${SERVICE_NAME}]   ${NOTIFY_PATHS.join(", ")} → ${NOTIFY_SERVICE_URL}`);
   console.log(`[${SERVICE_NAME}]   everything else (+ websockets) → ${BACKEND_URL}`);
   console.log(`[${SERVICE_NAME}]   health → http://localhost:${PORT}/gateway/health`);
 });
