@@ -23,7 +23,7 @@ if (!SESSION_SECRET) {
 }
 
 // Paths owned by grn-service; everything else goes to the backend monolith
-const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", '/grnhealth'];
+const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", "/api/service_entry", "/api/invoice", "/api/payment", '/grnhealth'];
 const isGrnPath = (path) => GRN_PATHS.some((p) => path === p || path.startsWith(p + "/"));
 
 // Paths owned by notification-service — only the browser-facing bell
@@ -109,7 +109,7 @@ app.use(cookieParser(SESSION_SECRET));
 // and the whole supplier portal — an external-facing client that talks plain JSON,
 // including its own staff-triggered /invite endpoint) —
 // mirrors the skip-list in frontend/src/main.tsx's request interceptor.
-const CRYPTO_EXEMPT_PATHS = ["/api/secure", "/api/supplier", "/api-docs", "/gateway/health", "/health"];
+const CRYPTO_EXEMPT_PATHS = ["/api/secure", "/api/supplier", "/api/nonstaff", "/api/nonstaff_approval", "/api-docs", "/gateway/health", "/health"];
 const isCryptoExempt = (path) =>
   isSocketIoPath(path) || CRYPTO_EXEMPT_PATHS.some((p) => path === p || path.startsWith(p + "/"));
 
@@ -254,6 +254,7 @@ const backendProxy = createProxyMiddleware({
   on: { proxyReq: onProxyReq, proxyRes: onProxyRes },
 });
 
+console.log(backendProxy);
 app.use(grnProxy);
 app.use(notifyProxy);
 app.use(backendProxy);
