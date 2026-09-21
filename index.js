@@ -109,7 +109,10 @@ app.use(cookieParser(SESSION_SECRET));
 // and the whole supplier portal — an external-facing client that talks plain JSON,
 // including its own staff-triggered /invite endpoint) —
 // mirrors the skip-list in frontend/src/main.tsx's request interceptor.
-const CRYPTO_EXEMPT_PATHS = ["/api/secure", "/api/supplier", "/api/nonstaff", "/api/nonstaff_approval", "/api-docs", "/gateway/health", "/health"];
+// /api/public_kyc is the anonymous self-service KYC intake (/supplier_kyc) —
+// no session/Web-Crypto key exists for a first-time visitor, same reasoning
+// as /api/nonstaff.
+const CRYPTO_EXEMPT_PATHS = ["/api/secure", "/api/supplier", "/api/nonstaff", "/api/nonstaff_approval", "/api/public_kyc", "/api-docs", "/gateway/health", "/health"];
 const isCryptoExempt = (path) =>
   isSocketIoPath(path) || CRYPTO_EXEMPT_PATHS.some((p) => path === p || path.startsWith(p + "/"));
 
