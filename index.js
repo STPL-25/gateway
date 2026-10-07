@@ -23,7 +23,7 @@ if (!SESSION_SECRET) {
 }
 
 // Paths owned by grn-service; everything else goes to the backend monolith
-const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", "/api/service_entry", "/api/invoice", "/api/payment", '/grnhealth'];
+const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", "/api/service_entry", "/api/invoice", "/api/payment", "/api/asset_management", '/grnhealth'];
 const isGrnPath = (path) => GRN_PATHS.some((p) => path === p || path.startsWith(p + "/"));
 
 // Paths owned by notification-service — only the browser-facing bell
