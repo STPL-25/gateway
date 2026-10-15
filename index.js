@@ -5,13 +5,16 @@ import cookieParser from "cookie-parser";
 // Redis integration commented out — will be reintegrated later.
 // import { createClient } from "redis";
 import { configDotenv } from "dotenv";
+import { cashfreeRelay, CASHFREE_RELAY_PATH } from "./Middleware/cashfreeRelay.js";
 import { decryptRequestBody, encryptJson } from "./Middleware/payloadCrypto.js";
+import { PAYMENT_PATHS, isPaymentPath, isPaymentSocketPath, createPaymentSocketProxy } from "./Middleware/paymentProxy.js";
 configDotenv({ path: `.env.${process.env.NODE_ENV || "development"}` });
 
 const PORT = parseInt(process.env.PORT || "8080");
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8081";
 const GRN_SERVICE_URL = process.env.GRN_SERVICE_URL ;
 const NOTIFY_SERVICE_URL = process.env.NOTIFY_SERVICE_URL || "http://localhost:8086";
+const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || "http://localhost:8004";
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const FORWARDED_PROTO =
   (process.env.FORWARDED_PROTO || (process.env.NODE_ENV === "production" ? "https" : "")).toLowerCase();
@@ -23,7 +26,7 @@ if (!SESSION_SECRET) {
 }
 
 // Paths owned by grn-service; everything else goes to the backend monolith
-const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", "/api/service_entry", "/api/invoice", "/api/payment", "/api/asset_management", '/grnhealth'];
+const GRN_PATHS = ["/api/grn", "/api/gate_entry", "/api/inventory", "/api/stock_request", "/api/supplier", "/api/service_entry", "/api/invoice", "/api/asset_management", '/grnhealth'];
 const isGrnPath = (path) => GRN_PATHS.some((p) => path === p || path.startsWith(p + "/"));
 
 // Paths owned by notification-service — only the browser-facing bell
@@ -35,7 +38,7 @@ const isNotifyPath = (path) => NOTIFY_PATHS.some((p) => path === p || path.start
 
 // Stateless services (grn-service, notification-service) both need the
 // cookie->bearer bridge below.
-const isStatelessServicePath = (path) => isGrnPath(path) || isNotifyPath(path);
+const isStatelessServicePath = (path) => isGrnPath(path) || isNotifyPath(path) || isPaymentPath(path);
 const pathnameOf = (path = "") => path.split("?")[0];
 const isSocketIoPath = (path = "") => {
   const pathname = pathnameOf(path);
@@ -88,10 +91,12 @@ const socketProxy = createProxyMiddleware({
   target: BACKEND_URL,
   changeOrigin: true,
   xfwd: true,
-  ws: true,
+  ws: false,
   pathFilter: isSocketIoPath,
 });
 app.use(socketProxy);
+const paymentSocketProxy = createPaymentSocketProxy(PAYMENT_SERVICE_URL);
+app.use(paymentSocketProxy);
 
 app.use(express.json({ limit: "50mb" }));
 
@@ -112,9 +117,11 @@ app.use(cookieParser(SESSION_SECRET));
 // /api/public_kyc is the anonymous self-service KYC intake (/supplier_kyc) —
 // no session/Web-Crypto key exists for a first-time visitor, same reasoning
 // as /api/nonstaff.
-const CRYPTO_EXEMPT_PATHS = ["/api/secure", "/api/supplier", "/api/nonstaff", "/api/nonstaff_approval", "/api/public_kyc", "/api-docs", "/gateway/health", "/health"];
+const CRYPTO_EXEMPT_PATHS = ["/api/secure", "/api/supplier", "/api/nonstaff", "/api/nonstaff_approval", "/api/public_kyc", CASHFREE_RELAY_PATH, "/api-docs", "/gateway/health", "/paymenthealth", "/health"];
 const isCryptoExempt = (path) =>
-  isSocketIoPath(path) || CRYPTO_EXEMPT_PATHS.some((p) => path === p || path.startsWith(p + "/"));
+  isSocketIoPath(path) || isPaymentSocketPath(path) || CRYPTO_EXEMPT_PATHS.some((p) => path === p || path.startsWith(p + "/"));
+
+app.post(CASHFREE_RELAY_PATH, cashfreeRelay);
 
 app.use((req, res, next) => (isCryptoExempt(req.path) ? next() : decryptRequestBody(req, res, next)));
 
@@ -131,14 +138,15 @@ async function probe(url) {
 }
 
 app.get("/gateway/health", async (_req, res) => {
-  const [backend, grn, notify] = await Promise.all([
+  const [backend, grn, notify, payment] = await Promise.all([
     probe(`${BACKEND_URL}/health`),
     probe(`${GRN_SERVICE_URL}/health`),
     probe(`${NOTIFY_SERVICE_URL}/health`),
+    probe(`${PAYMENT_SERVICE_URL}/health/ready`),
   ]);
   // Redis integration commented out — will be reintegrated later.
   // const redis = redisClient.isReady ? "up" : "down";
-  const allUp = backend === "up" && grn === "up" && notify === "up";
+  const allUp = backend === "up" && grn === "up" && notify === "up" && payment === "up";
   res.status(allUp ? 200 : 503).json({
     service: SERVICE_NAME,
     status: "up",
@@ -147,6 +155,7 @@ app.get("/gateway/health", async (_req, res) => {
       backend: { url: BACKEND_URL, status: backend },
       "grn-service": { url: GRN_SERVICE_URL, status: grn },
       "notification-service": { url: NOTIFY_SERVICE_URL, status: notify },
+      "payment-service": { url: PAYMENT_SERVICE_URL, status: payment },
     },
   });
 });
@@ -247,12 +256,26 @@ const notifyProxy = createProxyMiddleware({
   on: { proxyReq: onProxyReq, proxyRes: onProxyRes },
 });
 
+const paymentProxy = createProxyMiddleware({
+  target: PAYMENT_SERVICE_URL,
+  changeOrigin: true,
+  xfwd: true,
+  pathFilter: isPaymentPath,
+  selfHandleResponse: true,
+  on: { proxyReq: onProxyReq, proxyRes: onProxyRes, error: (_error, _req, res) => {
+    if (!res.headersSent) {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "Payment service unavailable" }));
+    }
+  } },
+});
+
 // Catch-all → backend monolith. Socket.IO is handled by socketProxy above.
 const backendProxy = createProxyMiddleware({
   target: BACKEND_URL,
   changeOrigin: true,
   xfwd: true,
-  pathFilter: (path) => !isSocketIoPath(path),
+  pathFilter: (path) => !isSocketIoPath(path) && !isPaymentSocketPath(path) && !isPaymentPath(path),
   selfHandleResponse: true,
   on: { proxyReq: onProxyReq, proxyRes: onProxyRes },
 });
@@ -260,10 +283,15 @@ const backendProxy = createProxyMiddleware({
 console.log(backendProxy);
 app.use(grnProxy);
 app.use(notifyProxy);
+app.use(paymentProxy);
 app.use(backendProxy);
 
 // Socket.IO websocket upgrades bypass Express routing — wire them explicitly
-server.on("upgrade", socketProxy.upgrade);
+server.on("upgrade", (req, socket, head) => {
+  if (isPaymentSocketPath(req.url)) paymentSocketProxy.upgrade(req, socket, head);
+  else if (isSocketIoPath(req.url)) socketProxy.upgrade(req, socket, head);
+  else socket.destroy();
+});
 
 // ----------------------------
 // START + GRACEFUL SHUTDOWN
@@ -272,6 +300,7 @@ server.listen(PORT, () => {
   console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
   console.log(`[${SERVICE_NAME}]   ${GRN_PATHS.join(", ")} → ${GRN_SERVICE_URL}`);
   console.log(`[${SERVICE_NAME}]   ${NOTIFY_PATHS.join(", ")} → ${NOTIFY_SERVICE_URL}`);
+  console.log(`[${SERVICE_NAME}]   ${PAYMENT_PATHS.join(", ")} + /payment/socket.io → ${PAYMENT_SERVICE_URL}`);
   console.log(`[${SERVICE_NAME}]   everything else (+ websockets) → ${BACKEND_URL}`);
   console.log(`[${SERVICE_NAME}]   health → http://localhost:${PORT}/gateway/health`);
 });

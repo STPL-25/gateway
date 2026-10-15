@@ -1,60 +1,31 @@
 # API Gateway — Non-Trade ERP
 
-Single public entry point (**port 8080**) in front of the two independent services:
-
-```
-                         ┌──────────────────────────────┐
- Browser (5173)          │  gateway :8080               │
- VITE_API_URL ─────────► │                              │
-                         │  /api/grn                    │      ┌────────────────────┐
-   cookie: sessionId     │  /api/gate_entry     ────────┼────► │ grn-service :8084  │
-                         │  /api/inventory              │      │ (stateless Bearer) │
-                         │   └─ session → Bearer bridge │      └────────────────────┘
-                         │                              │
-                         │  everything else             │      ┌────────────────────┐
-                         │  (/api/*, /api-docs,  ───────┼────► │ backend :8081      │
-                         │   /socket.io websockets)     │      │ (session monolith) │
-                         └──────────────────────────────┘      └────────────────────┘
-```
-
-Both services still run independently on their own ports; the gateway only
-routes — it never parses request bodies, so JSON, multipart uploads, and
-encrypted `{ d, iv }` payloads stream straight through.
-
-## Session → Bearer bridge
-
-The browser never holds the JWT — it only has the HttpOnly `sessionId`
-cookie, while `grn-service` is stateless and expects
-`Authorization: Bearer <jwt>`. For the three grn-service path prefixes the
-gateway:
-
-1. unsigns the `sessionId` cookie with the shared `SESSION_SECRET`,
-2. loads `sess:<sid>` from the shared Redis,
-3. injects `Authorization: Bearer <session.jwt>` into the proxied request.
-
-An explicit `Authorization` header on the incoming request (e.g. the dev
-bypass token from Postman) is passed through untouched.
-
-## Endpoints
+Single public entry point for backend-stpl, grn-service, notification-service and payment-service. Set the public port and downstream URLs in the gateway environment. Local deployed configurations use ports 8000 / 8001 / 8002 / 8003 / 8004 respectively; code defaults for older services may differ.
 
 | Path | Destination |
 |---|---|
-| `/api/grn`, `/api/gate_entry`, `/api/inventory` | grn-service (`GRN_SERVICE_URL`) |
-| `/gateway/health` | gateway itself — aggregates downstream `/health` checks |
-| everything else, incl. `/socket.io` websockets | backend (`BACKEND_URL`) |
+| `/api/grn`, `/api/gate_entry`, `/api/inventory`, `/api/stock_request`, `/api/supplier`, `/api/service_entry`, `/api/invoice`, `/api/asset_management`, `/grnhealth` | GRN_SERVICE_URL |
+| `/api/notifications` | NOTIFY_SERVICE_URL |
+| `/api/payment`, `/paymenthealth` | PAYMENT_SERVICE_URL (default `http://localhost:8004`) |
+| `/payment/socket.io` | payment-service Socket.IO, including polling and WebSocket upgrades |
+| `/socket.io` | backend-stpl Socket.IO, including polling and WebSocket upgrades |
+| `/gateway/health` | gateway; probes backend, GRN, notification and payment readiness |
+| Other paths | BACKEND_URL |
+
+Stateless service APIs accept Bearer JWTs. When a request instead carries a signed HttpOnly `sessionId` cookie, the gateway resolves it using backend-stpl's `/internal/session-jwt` endpoint and injects the JWT. Explicit Authorization headers take precedence. Redis session sharing is currently disabled.
+
+JSON requests can carry the existing AES-GCM `{ d, iv }` envelope. The gateway decrypts and reserializes those bodies for services, then encrypts their JSON responses for the browser. Both Socket.IO transports bypass body parsing and encryption so Engine.IO handshakes and long polling remain valid. Multipart bodies stream through. Socket upgrade dispatch chooses the matching service by transport path.
 
 ## Run
 
-```bash
-npm install
-npm run dev      # nodemon
-npm start        # node index.js
+```powershell
+npm ci
+# Configure .env (or export process environment variables).
+npm run dev
+# For normal startup:
+npm start
 ```
 
-Or from the repo root: `npm run dev` starts backend + grn-service + gateway
-together (see root `package.json`).
+`SESSION_SECRET` must match backend-stpl. `CRYPTO_SECRET` and `CRYPTO_SALT` must match the existing application's payload encryption. Configure `BACKEND_URL`, `GRN_SERVICE_URL`, `NOTIFY_SERVICE_URL` and `PAYMENT_SERVICE_URL` for the actual hosts. Existing environment templates are `.env.dev` / `.env.prod`; `../switch-env.ps1` can copy the selected template to `.env`.
 
-## Configuration
-
-Copy `.env.example` → `.env`. `SESSION_SECRET` **must** match the backend's,
-and Redis must be the same instance the backend stores sessions in.
+Install and migrate payment-service before restarting the updated gateway and GRN service. See [payment-service setup](../payment-service/README.md). The gateway retains all three existing payment endpoint names while routing them to the new owner.
